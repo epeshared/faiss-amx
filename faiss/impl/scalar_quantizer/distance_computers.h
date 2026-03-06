@@ -8,6 +8,8 @@
 #pragma once
 
 #include <faiss/impl/ScalarQuantizer.h>
+#include <faiss/impl/scalar_quantizer/quantizers.h>
+#include <faiss/impl/scalar_quantizer/similarities.h>
 #include <faiss/utils/simd_levels.h>
 #include <faiss/utils/simdlib.h>
 #include <faiss/utils/bf16.h>
