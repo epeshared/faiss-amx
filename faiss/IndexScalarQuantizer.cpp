@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <cstdio>
 
+#include <faiss/utils/bf16.h>
+#include <faiss/impl/scalar_quantizer/chunked_transposed.h>
+
 #include <omp.h>
 
 #include <faiss/impl/FaissAssert.h>
@@ -59,6 +62,64 @@ void IndexScalarQuantizer::search(
     FAISS_THROW_IF_NOT(
             metric_type == METRIC_L2 || metric_type == METRIC_INNER_PRODUCT);
 
+    // Use transposed layout optimization for BF16 IP search
+    if (sq.use_transposed_layout && sq.transposed_storage &&
+        metric_type == METRIC_INNER_PRODUCT && !sel) {
+        // Convert queries to BF16
+        std::vector<uint16_t> xq_bf16(n * d);
+        for (idx_t i = 0; i < n * d; i++) {
+            xq_bf16[i] = encode_bf16(x[i]);
+        }
+        
+        // Compute distances using transposed layout
+        std::vector<idx_t> ids(k);
+        for (idx_t i = 0; i < k; i++) {
+            ids[i] = i;
+        }
+        
+        // Initialize results
+        for (idx_t i = 0; i < n * k; i++) {
+            distances[i] = 0.0f;
+            labels[i] = -1;
+        }
+        
+        // For each query, compute IP with all stored vectors
+        // and keep top-k results
+        std::vector<float> all_dists(ntotal);
+        for (idx_t i = 0; i < n; i++) {
+            // Compute all distances using transposed layout
+            std::vector<idx_t> vec_ids(ntotal);
+            for (idx_t j = 0; j < ntotal; j++) {
+                vec_ids[j] = j;
+            }
+            
+            sq.transposed_storage->compute_ip_batch(
+                xq_bf16.data() + i * d, vec_ids.data(), ntotal, all_dists.data());
+            
+            // Find top-k
+            float* D = distances + i * k;
+            idx_t* I = labels + i * k;
+            
+            // Initialize heap with first k elements
+            for (idx_t j = 0; j < std::min(int64_t(k), ntotal); j++) {
+                D[j] = all_dists[j];
+                I[j] = j;
+            }
+            minheap_heapify(k, D, I);
+            
+            // Add remaining elements
+            for (idx_t j = k; j < ntotal; j++) {
+                if (all_dists[j] > D[0]) {
+                    D[0] = all_dists[j];
+                    I[0] = j;
+                    minheap_pop(k, D, I);
+                }
+            }
+            minheap_reorder(k, D, I);
+        }
+        return;
+    }
+
 #pragma omp parallel
     {
         std::unique_ptr<InvertedListScanner> scanner(
@@ -95,6 +156,12 @@ FlatCodesDistanceComputer* IndexScalarQuantizer::get_FlatCodesDistanceComputer()
             sq.get_distance_computer(metric_type);
     dc->code_size = sq.code_size;
     dc->codes = codes.data();
+    dc->set_level0_batch_hint(
+        sq.using_amx_hnsw_layout(), sq.amx_hnsw_chunk_size);
+    dc->set_level0_chunk_bounds(
+            sq.get_amx_hnsw_chunk_centroids(),
+            sq.get_amx_hnsw_chunk_radii(),
+            sq.get_amx_hnsw_num_chunks());
     return dc;
 }
 
@@ -110,6 +177,66 @@ void IndexScalarQuantizer::sa_decode(idx_t n, const uint8_t* bytes, float* x)
         const {
     FAISS_THROW_IF_NOT(is_trained);
     sq.decode(bytes, x, n);
+}
+
+void IndexScalarQuantizer::set_transposed_layout(size_t chunk_size) {
+    FAISS_THROW_IF_NOT(sq.qtype == ScalarQuantizer::QT_bf16);
+    FAISS_THROW_IF_NOT(ntotal == 0); // must be called before adding vectors
+    sq.use_transposed_layout = true;
+    sq.transposed_chunk_size = chunk_size;
+}
+
+bool IndexScalarQuantizer::using_transposed_layout() const {
+    return sq.use_transposed_layout && sq.transposed_storage != nullptr;
+}
+
+void IndexScalarQuantizer::add(idx_t n, const float* x) {
+    FAISS_THROW_IF_NOT(is_trained);
+    if (n == 0) {
+        return;
+    }
+    // Add to regular codes
+    codes.resize((ntotal + n) * code_size);
+    sa_encode(n, x, codes.data() + (ntotal * code_size));
+    sq.invalidate_amx_hnsw_layout();
+    
+    // Add to transposed storage if enabled
+    if (sq.use_transposed_layout) {
+        sq.add_vectors_transposed(x, n);
+    }
+    
+    ntotal += n;
+}
+
+void IndexScalarQuantizer::reset() {
+    sq.invalidate_amx_hnsw_layout();
+    sq.transposed_storage.reset();
+    IndexFlatCodes::reset();
+}
+
+void IndexScalarQuantizer::enable_amx_hnsw_layout(size_t chunk_size) {
+    FAISS_THROW_IF_NOT(metric_type == METRIC_INNER_PRODUCT);
+    sq.enable_amx_hnsw_layout(chunk_size);
+}
+
+void IndexScalarQuantizer::disable_amx_hnsw_layout() {
+    sq.disable_amx_hnsw_layout();
+}
+
+void IndexScalarQuantizer::finalize_amx_hnsw_layout() {
+    sq.finalize_amx_hnsw_layout(ntotal, codes.data());
+}
+
+void IndexScalarQuantizer::invalidate_amx_hnsw_layout() {
+    sq.invalidate_amx_hnsw_layout();
+}
+
+bool IndexScalarQuantizer::using_amx_hnsw_layout() const {
+    return sq.using_amx_hnsw_layout();
+}
+
+bool IndexScalarQuantizer::amx_hnsw_layout_enabled() const {
+    return sq.amx_hnsw_layout_enabled();
 }
 
 /*******************************************************************

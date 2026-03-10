@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 function(link_to_faiss_lib target)
-  if(NOT FAISS_OPT_LEVEL STREQUAL "avx2" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr" AND NOT FAISS_OPT_LEVEL STREQUAL "sve" AND NOT FAISS_OPT_LEVEL STREQUAL "dd")
+  if(NOT FAISS_OPT_LEVEL STREQUAL "avx2" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr" AND NOT FAISS_OPT_LEVEL STREQUAL "amx" AND NOT FAISS_OPT_LEVEL STREQUAL "sve" AND NOT FAISS_OPT_LEVEL STREQUAL "dd")
     target_link_libraries(${target} PRIVATE faiss)
   endif()
 
@@ -36,6 +36,16 @@ function(link_to_faiss_lib target)
       target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
     endif()
     target_link_libraries(${target} PRIVATE faiss_avx512_spr)
+  endif()
+
+  if(FAISS_OPT_LEVEL STREQUAL "amx")
+    if(NOT WIN32)
+      target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids -mamx-tile -mamx-bf16>)
+    else()
+      target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
+    endif()
+    target_compile_definitions(${target} PRIVATE FAISS_OPT_AMX COMPILE_SIMD_AVX2 COMPILE_SIMD_AVX512)
+    target_link_libraries(${target} PRIVATE faiss_amx)
   endif()
 
   if(FAISS_OPT_LEVEL STREQUAL "sve")

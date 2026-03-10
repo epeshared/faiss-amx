@@ -207,6 +207,16 @@ struct IndexHNSWSQ : IndexHNSW {
             ScalarQuantizer::QuantizerType qtype,
             int M,
             MetricType metric = METRIC_L2);
+
+        void enable_amx_level0_optimization(size_t chunk_size = 64);
+
+        void disable_amx_level0_optimization();
+
+        void finalize_amx_level0_optimization();
+
+        bool using_amx_level0_optimization() const;
+
+        void permute_entries(const idx_t* perm) override;
 };
 
 /** 2-level code structure with fast random access

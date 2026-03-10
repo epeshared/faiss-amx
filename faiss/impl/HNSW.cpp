@@ -7,6 +7,7 @@
 
 #include <faiss/impl/HNSW.h>
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstddef>
 
@@ -614,6 +615,81 @@ static inline void extract_search_params(
     }
 }
 
+template <typename ThresholdFn, typename ConsumerFn>
+size_t process_level0_chunk_batches(
+        DistanceComputer& qdis,
+        const idx_t* ids,
+        size_t nids,
+        HNSWStats& stats,
+        ThresholdFn&& threshold_fn,
+        ConsumerFn&& consumer) {
+    if (nids == 0) {
+        return 0;
+    }
+
+    thread_local std::vector<idx_t> sorted_ids;
+    thread_local std::vector<uint32_t> offsets;
+    thread_local std::vector<float> distances;
+
+    sorted_ids.assign(ids, ids + nids);
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    offsets.resize(nids);
+    distances.resize(nids);
+
+    const size_t chunk_size = qdis.level0_chunk_size();
+    FAISS_THROW_IF_NOT_MSG(
+            chunk_size > 0,
+            "level-0 chunk batching requires a positive chunk size");
+
+    size_t evaluated = 0;
+    for (size_t i = 0; i < nids;) {
+        const idx_t chunk_id = sorted_ids[i] / chunk_size;
+        size_t chunk_end = i + 1;
+        while (chunk_end < nids && sorted_ids[chunk_end] / chunk_size == chunk_id) {
+            ++chunk_end;
+        }
+
+        if (qdis.supports_level0_chunk_pruning()) {
+            const float lower_bound =
+                    qdis.level0_chunk_distance_lower_bound(chunk_id);
+            if (lower_bound > threshold_fn()) {
+                stats.level0_pruned_chunks += 1;
+                stats.level0_pruned_candidates += chunk_end - i;
+                i = chunk_end;
+                continue;
+            }
+        }
+
+        for (size_t j = i; j < chunk_end; ++j) {
+            offsets[j] = sorted_ids[j] % chunk_size;
+        }
+
+        if (qdis.supports_level0_batch_chunk()) {
+            qdis.distances_batch_chunk(
+                    chunk_id,
+                    chunk_end - i,
+                    offsets.data() + i,
+                    distances.data() + i);
+        } else {
+            qdis.distances_batch(
+                    chunk_end - i,
+                    sorted_ids.data() + i,
+                    distances.data() + i);
+        }
+
+        stats.level0_batch_calls += 1;
+        stats.level0_batch_candidates += chunk_end - i;
+        evaluated += chunk_end - i;
+        for (size_t j = i; j < chunk_end; ++j) {
+            consumer(sorted_ids[j], distances[j]);
+        }
+
+        i = chunk_end;
+    }
+
+    return evaluated;
+}
+
 /** Do a BFS on the candidates list */
 int search_from_candidates(
         const HNSW& hnsw,
@@ -698,6 +774,29 @@ int search_from_candidates(
             candidates.push(idx, dis);
         };
 
+#if defined(FAISS_OPT_AMX)
+        if (level == 0 && qdis.supports_level0_batch()) {
+            thread_local std::vector<idx_t> buffered_ids;
+            buffered_ids.clear();
+            buffered_ids.reserve(jmax - begin);
+
+            for (size_t j = begin; j < jmax; j++) {
+                int v1 = hnsw.neighbors[j];
+
+                if (vt.set(v1)) {
+                    buffered_ids.push_back(v1);
+                }
+            }
+
+            ndis += process_level0_chunk_batches(
+                    qdis,
+                    buffered_ids.data(),
+                    buffered_ids.size(),
+                    stats,
+                    [&]() { return threshold; },
+                    [&](idx_t idx, float dis) { add_to_heap(idx, dis); });
+        } else {
+#endif
         for (size_t j = begin; j < jmax; j++) {
             int v1 = hnsw.neighbors[j];
 
@@ -732,6 +831,9 @@ int search_from_candidates(
 
             ndis += 1;
         }
+#if defined(FAISS_OPT_AMX)
+        }
+#endif
 
         nstep++;
         if (!do_dis_check && nstep > efSearch) {
@@ -1126,6 +1228,31 @@ HNSWStats greedy_update_nearest(
         int n_buffered = 0;
         storage_idx_t buffered_ids[4];
 
+#if defined(FAISS_OPT_AMX)
+        if (level == 0 && qdis.supports_level0_batch()) {
+            thread_local std::vector<idx_t> batch_ids;
+            batch_ids.clear();
+            batch_ids.reserve(end - begin);
+
+            for (size_t j = begin; j < end; j++) {
+                storage_idx_t v = hnsw.neighbors[j];
+                if (v < 0) {
+                    break;
+                }
+                batch_ids.push_back(v);
+            }
+
+            ndis = process_level0_chunk_batches(
+                    qdis,
+                    batch_ids.data(),
+                    batch_ids.size(),
+                    stats,
+                    [&]() { return d_nearest; },
+                    [&](idx_t idx, float dis) {
+                        update_with_candidate(idx, dis);
+                    });
+        } else {
+#endif
         for (size_t j = begin; j < end; j++) {
             storage_idx_t v = hnsw.neighbors[j];
             if (v < 0) {
@@ -1161,6 +1288,9 @@ HNSWStats greedy_update_nearest(
             float dis = qdis(buffered_ids[icnt]);
             update_with_candidate(buffered_ids[icnt], dis);
         }
+    #if defined(FAISS_OPT_AMX)
+        }
+    #endif
 
         // update stats
         stats.ndis += ndis;

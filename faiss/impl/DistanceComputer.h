@@ -7,6 +7,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <limits>
+#include <vector>
+
 #include <faiss/Index.h>
 
 namespace faiss {
@@ -53,6 +57,59 @@ struct DistanceComputer {
         dis3 = d3;
     }
 
+    /// compute distances of current query to a batch of stored vectors.
+    /// Default implementation falls back to per-vector computation.
+    virtual void distances_batch(size_t n, const idx_t* idx, float* dis) {
+        for (size_t i = 0; i < n; i++) {
+            dis[i] = this->operator()(idx[i]);
+        }
+    }
+
+    virtual bool supports_level0_batch() const {
+        return false;
+    }
+
+    virtual size_t level0_chunk_size() const {
+        return 0;
+    }
+
+    virtual bool supports_level0_batch_chunk() const {
+        return false;
+    }
+
+    virtual void distances_batch_chunk(
+            idx_t chunk_id,
+            size_t n,
+            const uint32_t* offsets,
+            float* dis) {
+        const size_t chunk_size = level0_chunk_size();
+        FAISS_THROW_IF_NOT_MSG(
+                chunk_size > 0,
+                "level-0 chunk batching requires a positive chunk size");
+        thread_local std::vector<idx_t> ids;
+        ids.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            ids[i] = chunk_id * chunk_size + offsets[i];
+        }
+        distances_batch(n, ids.data(), dis);
+    }
+
+    virtual bool supports_level0_chunk_pruning() const {
+        return false;
+    }
+
+    virtual float level0_chunk_distance_lower_bound(idx_t) const {
+        return -std::numeric_limits<float>::infinity();
+    }
+
+    virtual bool supports_level0_chunk_similarity_upper_bound() const {
+        return false;
+    }
+
+    virtual float level0_chunk_similarity_upper_bound(idx_t) const {
+        return std::numeric_limits<float>::infinity();
+    }
+
     /// compute distance between two stored vectors
     virtual float symmetric_dis(idx_t i, idx_t j) = 0;
 
@@ -93,6 +150,44 @@ struct NegativeDistanceComputer : DistanceComputer {
         dis1 = -dis1;
         dis2 = -dis2;
         dis3 = -dis3;
+    }
+
+    void distances_batch(size_t n, const idx_t* idx, float* dis) override {
+        basedis->distances_batch(n, idx, dis);
+        for (size_t i = 0; i < n; i++) {
+            dis[i] = -dis[i];
+        }
+    }
+
+    bool supports_level0_batch() const override {
+        return basedis->supports_level0_batch();
+    }
+
+    size_t level0_chunk_size() const override {
+        return basedis->level0_chunk_size();
+    }
+
+    bool supports_level0_batch_chunk() const override {
+        return basedis->supports_level0_batch_chunk();
+    }
+
+    void distances_batch_chunk(
+            idx_t chunk_id,
+            size_t n,
+            const uint32_t* offsets,
+            float* dis) override {
+        basedis->distances_batch_chunk(chunk_id, n, offsets, dis);
+        for (size_t i = 0; i < n; ++i) {
+            dis[i] = -dis[i];
+        }
+    }
+
+    bool supports_level0_chunk_pruning() const override {
+        return basedis->supports_level0_chunk_similarity_upper_bound();
+    }
+
+    float level0_chunk_distance_lower_bound(idx_t chunk_id) const override {
+        return -basedis->level0_chunk_similarity_upper_bound(chunk_id);
     }
 
     /// compute distance between two stored vectors

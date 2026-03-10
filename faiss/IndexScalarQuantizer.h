@@ -26,6 +26,10 @@ struct IndexScalarQuantizer : IndexFlatCodes {
     /// Used to encode the vectors
     ScalarQuantizer sq;
 
+    // Delete copy constructor/assignment since ScalarQuantizer has unique_ptr
+    IndexScalarQuantizer(const IndexScalarQuantizer&) = delete;
+    IndexScalarQuantizer& operator=(const IndexScalarQuantizer&) = delete;
+
     /** Constructor.
      *
      * @param d      dimensionality of the input vectors
@@ -55,6 +59,39 @@ struct IndexScalarQuantizer : IndexFlatCodes {
     void sa_encode(idx_t n, const float* x, uint8_t* bytes) const override;
 
     void sa_decode(idx_t n, const uint8_t* bytes, float* x) const override;
+
+    /**
+     * Enable transposed layout for BF16 quantization (AMX optimization).
+     * Must be called before adding vectors.
+     * Only applicable when sq.qtype == QT_bf16.
+     *
+     * @param chunk_size Number of vectors per chunk (default 64)
+     */
+    void set_transposed_layout(size_t chunk_size = 64);
+
+    /**
+     * Check if transposed layout is enabled.
+     */
+    bool using_transposed_layout() const;
+
+    /**
+     * Override add to support transposed layout for BF16.
+     */
+    void add(idx_t n, const float* x) override;
+
+        void reset() override;
+
+        void enable_amx_hnsw_layout(size_t chunk_size = 64);
+
+        void disable_amx_hnsw_layout();
+
+        void finalize_amx_hnsw_layout();
+
+        void invalidate_amx_hnsw_layout();
+
+        bool using_amx_hnsw_layout() const;
+
+        bool amx_hnsw_layout_enabled() const;
 };
 
 /** An IVF implementation where the components of the residuals are
@@ -65,6 +102,10 @@ struct IndexScalarQuantizer : IndexFlatCodes {
 
 struct IndexIVFScalarQuantizer : IndexIVF {
     ScalarQuantizer sq;
+
+    // Delete copy constructor/assignment since ScalarQuantizer has unique_ptr
+    IndexIVFScalarQuantizer(const IndexIVFScalarQuantizer&) = delete;
+    IndexIVFScalarQuantizer& operator=(const IndexIVFScalarQuantizer&) = delete;
 
     IndexIVFScalarQuantizer(
             Index* quantizer,

@@ -107,9 +107,8 @@ IndexIVF* Cloner::clone_IndexIVF(const IndexIVF* ivf) {
 
     TRYCLONE(IndexIVFSpectralHash, ivf)
 
-    TRYCLONE(IndexIVFScalarQuantizer, ivf) {
-        FAISS_THROW_MSG("clone not supported for this type of IndexIVF");
-    }
+    // TRYCLONE(IndexIVFScalarQuantizer, ivf) - not copyable due to unique_ptr
+    FAISS_THROW_MSG("clone not supported for this type of IndexIVF");
     return nullptr;
 }
 
@@ -288,7 +287,7 @@ Index* Cloner::clone_Index(const Index* index) {
     TRYCLONE(IndexRandom, index)
     TRYCLONE(IndexPQFastScan, index)
 
-    TRYCLONE(IndexScalarQuantizer, index)
+    // TRYCLONE(IndexScalarQuantizer, index) - not copyable due to unique_ptr
     TRYCLONE(MultiIndexQuantizer, index)
 
     if (const IndexIVF* ivf = dynamic_cast<const IndexIVF*>(index)) {
@@ -396,7 +395,7 @@ Quantizer* clone_Quantizer(const Quantizer* quant) {
     TRYCLONE(ResidualQuantizer, quant)
     TRYCLONE(LocalSearchQuantizer, quant)
     TRYCLONE(ProductQuantizer, quant)
-    TRYCLONE(ScalarQuantizer, quant)
+    // TRYCLONE(ScalarQuantizer, quant) - not copyable due to unique_ptr
     FAISS_THROW_MSG("Did not recognize quantizer to clone");
 }
 

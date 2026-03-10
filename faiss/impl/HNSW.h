@@ -253,11 +253,19 @@ struct HNSWStats {
             0; /// number of queries for which the candidate list is exhausted
     size_t ndis = 0;  /// number of distances computed
     size_t nhops = 0; /// number of hops aka number of edges traversed
+        size_t level0_batch_calls = 0; /// number of level-0 batch distance calls
+        size_t level0_batch_candidates = 0; /// candidates evaluated via batch path
+        size_t level0_pruned_chunks = 0; /// level-0 chunks skipped by pruning
+        size_t level0_pruned_candidates = 0; /// candidates skipped via chunk pruning
 
     void reset() {
         n1 = n2 = 0;
         ndis = 0;
         nhops = 0;
+                level0_batch_calls = 0;
+                level0_batch_candidates = 0;
+                level0_pruned_chunks = 0;
+                level0_pruned_candidates = 0;
     }
 
     void combine(const HNSWStats& other) {
@@ -265,6 +273,10 @@ struct HNSWStats {
         n2 += other.n2;
         ndis += other.ndis;
         nhops += other.nhops;
+                level0_batch_calls += other.level0_batch_calls;
+                level0_batch_candidates += other.level0_batch_candidates;
+                level0_pruned_chunks += other.level0_pruned_chunks;
+                level0_pruned_candidates += other.level0_pruned_candidates;
     }
 };
 
