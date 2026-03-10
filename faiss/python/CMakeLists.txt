@@ -70,11 +70,13 @@ configure_file(swigfaiss.swig ${CMAKE_CURRENT_SOURCE_DIR}/swigfaiss_avx2.swig CO
 configure_file(swigfaiss.swig ${CMAKE_CURRENT_SOURCE_DIR}/swigfaiss_avx512.swig COPYONLY)
 configure_file(swigfaiss.swig ${CMAKE_CURRENT_SOURCE_DIR}/swigfaiss_avx512_spr.swig COPYONLY)
 configure_file(swigfaiss.swig ${CMAKE_CURRENT_SOURCE_DIR}/swigfaiss_sve.swig COPYONLY)
+configure_file(swigfaiss.swig ${CMAKE_CURRENT_SOURCE_DIR}/swigfaiss_amx.swig COPYONLY)
 
 configure_swigfaiss(swigfaiss.swig)
 configure_swigfaiss(swigfaiss_avx2.swig)
 configure_swigfaiss(swigfaiss_avx512.swig)
 configure_swigfaiss(swigfaiss_avx512_spr.swig)
+configure_swigfaiss(swigfaiss_amx.swig)
 configure_swigfaiss(swigfaiss_sve.swig)
 configure_swigfaiss(faiss_example_external_module.swig)
 
@@ -90,6 +92,8 @@ if(TARGET faiss)
       "${faiss_SOURCE_DIR}/faiss/${h}")
     list(APPEND SWIG_MODULE_swigfaiss_avx512_spr_EXTRA_DEPS
       "${faiss_SOURCE_DIR}/faiss/${h}")
+    list(APPEND SWIG_MODULE_swigfaiss_amx_EXTRA_DEPS
+      "${faiss_SOURCE_DIR}/faiss/${h}")
     list(APPEND SWIG_MODULE_swigfaiss_sve_EXTRA_DEPS
       "${faiss_SOURCE_DIR}/faiss/${h}")
     list(APPEND SWIG_MODULE_faiss_example_external_module_EXTRA_DEPS
@@ -103,6 +107,8 @@ if(TARGET faiss)
     list(APPEND SWIG_MODULE_swigfaiss_avx512_EXTRA_DEPS
       "${faiss_SOURCE_DIR}/faiss/gpu/${h}")
     list(APPEND SWIG_MODULE_swigfaiss_avx512_spr_EXTRA_DEPS
+      "${faiss_SOURCE_DIR}/faiss/gpu/${h}")
+    list(APPEND SWIG_MODULE_swigfaiss_amx_EXTRA_DEPS
       "${faiss_SOURCE_DIR}/faiss/gpu/${h}")
     list(APPEND SWIG_MODULE_swigfaiss_sve_EXTRA_DEPS
       "${faiss_SOURCE_DIR}/faiss/gpu/${h}")
@@ -164,6 +170,18 @@ if(NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr")
   set_target_properties(swigfaiss_avx512_spr PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
+
+set_property(SOURCE swigfaiss_amx.swig
+  PROPERTY SWIG_MODULE_NAME swigfaiss_amx)
+swig_add_library(swigfaiss_amx
+  TYPE SHARED
+  LANGUAGE python
+  SOURCES swigfaiss_amx.swig
+)
+set_property(TARGET swigfaiss_amx PROPERTY SWIG_COMPILE_OPTIONS -doxygen)
+if(NOT FAISS_OPT_LEVEL STREQUAL "amx")
+  set_target_properties(swigfaiss_amx PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
 set_property(SOURCE swigfaiss_sve.swig
   PROPERTY SWIG_MODULE_NAME swigfaiss_sve)
 swig_add_library(swigfaiss_sve
@@ -271,6 +289,13 @@ target_link_libraries(swigfaiss_avx512_spr PRIVATE
   OpenMP::OpenMP_CXX
 )
 
+
+target_link_libraries(swigfaiss_amx PRIVATE
+  faiss_amx
+  Python::Module
+  Python::NumPy
+  OpenMP::OpenMP_CXX
+)
 target_link_libraries(swigfaiss_sve PRIVATE
   faiss_sve
   Python::Module
@@ -292,6 +317,7 @@ target_include_directories(swigfaiss PRIVATE ${PROJECT_SOURCE_DIR}/../..)
 target_include_directories(swigfaiss_avx2 PRIVATE ${PROJECT_SOURCE_DIR}/../..)
 target_include_directories(swigfaiss_avx512 PRIVATE ${PROJECT_SOURCE_DIR}/../..)
 target_include_directories(swigfaiss_avx512_spr PRIVATE ${PROJECT_SOURCE_DIR}/../..)
+target_include_directories(swigfaiss_amx PRIVATE ${PROJECT_SOURCE_DIR}/../..)
 target_include_directories(swigfaiss_sve PRIVATE ${PROJECT_SOURCE_DIR}/../..)
 target_include_directories(faiss_example_external_module PRIVATE ${PROJECT_SOURCE_DIR}/../..)
 
@@ -319,6 +345,7 @@ target_link_libraries(swigfaiss PRIVATE faiss_python_callbacks)
 target_link_libraries(swigfaiss_avx2 PRIVATE faiss_python_callbacks)
 target_link_libraries(swigfaiss_avx512 PRIVATE faiss_python_callbacks)
 target_link_libraries(swigfaiss_avx512_spr PRIVATE faiss_python_callbacks)
+target_link_libraries(swigfaiss_amx PRIVATE faiss_python_callbacks)
 target_link_libraries(swigfaiss_sve PRIVATE faiss_python_callbacks)
 target_link_libraries(faiss_example_external_module PRIVATE faiss_python_callbacks)
 

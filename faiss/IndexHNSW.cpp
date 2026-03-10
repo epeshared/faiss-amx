@@ -17,6 +17,7 @@
 #include <memory>
 #include <queue>
 #include <random>
+#include <deque>
 
 #include <cstdint>
 #include "faiss/Index.h"
@@ -44,6 +45,54 @@ HNSWStats hnsw_stats;
  **************************************************************/
 
 namespace {
+
+std::vector<idx_t> build_level0_bfs_permutation(const HNSW& hnsw) {
+    const idx_t n = hnsw.levels.size();
+    std::vector<idx_t> perm;
+    perm.reserve(n);
+    std::vector<uint8_t> enqueued(n, 0);
+    std::deque<storage_idx_t> frontier;
+
+    auto enqueue = [&](storage_idx_t v) {
+        if (v >= 0 && v < n && !enqueued[v]) {
+            enqueued[v] = 1;
+            frontier.push_back(v);
+        }
+    };
+
+    enqueue(hnsw.entry_point);
+
+    while (perm.size() < size_t(n)) {
+        if (frontier.empty()) {
+            for (idx_t i = 0; i < n; ++i) {
+                if (!enqueued[i]) {
+                    enqueue(i);
+                    break;
+                }
+            }
+        }
+
+        if (frontier.empty()) {
+            break;
+        }
+
+        const storage_idx_t current = frontier.front();
+        frontier.pop_front();
+        perm.push_back(current);
+
+        size_t begin, end;
+        hnsw.neighbor_range(current, 0, &begin, &end);
+        for (size_t j = begin; j < end; ++j) {
+            const storage_idx_t neighbor = hnsw.neighbors[j];
+            if (neighbor < 0) {
+                break;
+            }
+            enqueue(neighbor);
+        }
+    }
+
+    return perm;
+}
 
 DistanceComputer* storage_distance_computer(const Index* storage) {
     if (is_similarity_metric(storage->metric_type)) {
@@ -257,6 +306,8 @@ void hnsw_search(
         }
     }
     size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+    size_t level0_batch_calls = 0, level0_batch_candidates = 0;
+    size_t level0_pruned_chunks = 0, level0_pruned_candidates = 0;
 
     idx_t check_period = InterruptCallback::get_period_hint(
             hnsw.max_level * index->d * efSearch);
@@ -272,7 +323,7 @@ void hnsw_search(
             std::unique_ptr<DistanceComputer> dis(
                     storage_distance_computer(index->storage));
 
-#pragma omp for reduction(+ : n1, n2, ndis, nhops) schedule(guided)
+#pragma omp for reduction(+ : n1, n2, ndis, nhops, level0_batch_calls, level0_batch_candidates, level0_pruned_chunks, level0_pruned_candidates) schedule(guided)
             for (idx_t i = i0; i < i1; i++) {
                 res.begin(i);
                 dis->set_query(x + i * index->d);
@@ -282,13 +333,26 @@ void hnsw_search(
                 n2 += stats.n2;
                 ndis += stats.ndis;
                 nhops += stats.nhops;
+                level0_batch_calls += stats.level0_batch_calls;
+                level0_batch_candidates += stats.level0_batch_candidates;
+                level0_pruned_chunks += stats.level0_pruned_chunks;
+                level0_pruned_candidates += stats.level0_pruned_candidates;
                 res.end();
             }
         }
         InterruptCallback::check();
     }
 
-    hnsw_stats.combine({n1, n2, ndis, nhops});
+    HNSWStats aggregate;
+    aggregate.n1 = n1;
+    aggregate.n2 = n2;
+    aggregate.ndis = ndis;
+    aggregate.nhops = nhops;
+    aggregate.level0_batch_calls = level0_batch_calls;
+    aggregate.level0_batch_candidates = level0_batch_candidates;
+    aggregate.level0_pruned_chunks = level0_pruned_chunks;
+    aggregate.level0_pruned_candidates = level0_pruned_candidates;
+    hnsw_stats.combine(aggregate);
 }
 
 } // anonymous namespace
@@ -749,6 +813,59 @@ IndexHNSWSQ::IndexHNSWSQ(
 
 IndexHNSWSQ::IndexHNSWSQ() = default;
 
+void IndexHNSWSQ::enable_amx_level0_optimization(size_t chunk_size) {
+    auto* sq_index = dynamic_cast<IndexScalarQuantizer*>(storage);
+    FAISS_THROW_IF_NOT_MSG(
+            sq_index,
+            "AMX level-0 optimization requires IndexScalarQuantizer storage");
+    sq_index->enable_amx_hnsw_layout(chunk_size);
+}
+
+void IndexHNSWSQ::disable_amx_level0_optimization() {
+    auto* sq_index = dynamic_cast<IndexScalarQuantizer*>(storage);
+    FAISS_THROW_IF_NOT_MSG(
+            sq_index,
+            "AMX level-0 optimization requires IndexScalarQuantizer storage");
+    sq_index->disable_amx_hnsw_layout();
+}
+
+void IndexHNSWSQ::finalize_amx_level0_optimization() {
+    auto* sq_index = dynamic_cast<IndexScalarQuantizer*>(storage);
+    FAISS_THROW_IF_NOT_MSG(
+            sq_index,
+            "AMX level-0 optimization requires IndexScalarQuantizer storage");
+    FAISS_THROW_IF_NOT_MSG(
+            sq_index->amx_hnsw_layout_enabled(),
+            "enable_amx_level0_optimization() must be called first");
+    FAISS_THROW_IF_NOT_MSG(
+            sq_index->sq.qtype == ScalarQuantizer::QT_bf16 &&
+                    metric_type == METRIC_INNER_PRODUCT,
+            "AMX level-0 optimization only supports BF16 inner-product SQ indexes");
+
+#if defined(FAISS_OPT_AMX)
+    if (ntotal > 1) {
+        std::vector<idx_t> perm = build_level0_bfs_permutation(hnsw);
+        if (perm.size() == size_t(ntotal)) {
+            permute_entries(perm.data());
+        }
+    }
+#endif
+
+    sq_index->finalize_amx_hnsw_layout();
+}
+
+bool IndexHNSWSQ::using_amx_level0_optimization() const {
+    const auto* sq_index = dynamic_cast<const IndexScalarQuantizer*>(storage);
+    return sq_index && sq_index->using_amx_hnsw_layout();
+}
+
+void IndexHNSWSQ::permute_entries(const idx_t* perm) {
+    if (auto* sq_index = dynamic_cast<IndexScalarQuantizer*>(storage)) {
+        sq_index->invalidate_amx_hnsw_layout();
+    }
+    IndexHNSW::permute_entries(perm);
+}
+
 /**************************************************************
  * IndexHNSW2Level implementation
  **************************************************************/
@@ -852,6 +969,8 @@ void IndexHNSW2Level::search(
 
     } else { // "mixed" search
         size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
+        size_t level0_batch_calls = 0, level0_batch_candidates = 0;
+        size_t level0_pruned_chunks = 0, level0_pruned_candidates = 0;
 
         const IndexIVFPQ* index_ivfpq =
                 dynamic_cast<const IndexIVFPQ*>(storage);
@@ -933,6 +1052,10 @@ void IndexHNSW2Level::search(
                 n2 += search_stats.n2;
                 ndis += search_stats.ndis;
                 nhops += search_stats.nhops;
+                level0_batch_calls += search_stats.level0_batch_calls;
+                level0_batch_candidates += search_stats.level0_batch_candidates;
+                level0_pruned_chunks += search_stats.level0_pruned_chunks;
+                level0_pruned_candidates += search_stats.level0_pruned_candidates;
 
                 vt.advance();
                 vt.advance();
@@ -941,7 +1064,16 @@ void IndexHNSW2Level::search(
             }
         }
 
-        hnsw_stats.combine({n1, n2, ndis, nhops});
+        HNSWStats aggregate;
+        aggregate.n1 = n1;
+        aggregate.n2 = n2;
+        aggregate.ndis = ndis;
+        aggregate.nhops = nhops;
+        aggregate.level0_batch_calls = level0_batch_calls;
+        aggregate.level0_batch_candidates = level0_batch_candidates;
+        aggregate.level0_pruned_chunks = level0_pruned_chunks;
+        aggregate.level0_pruned_candidates = level0_pruned_candidates;
+        hnsw_stats.combine(aggregate);
     }
 }
 

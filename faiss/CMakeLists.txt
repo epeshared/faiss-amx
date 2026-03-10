@@ -111,6 +111,7 @@ set(FAISS_SRC
   impl/ProductAdditiveQuantizer.cpp
   impl/ScalarQuantizer.cpp
   impl/scalar_quantizer/training.cpp
+  impl/scalar_quantizer/sq-amx.cpp
   impl/index_read.cpp
   impl/index_write.cpp
   impl/io.cpp
@@ -253,6 +254,7 @@ set(FAISS_HEADERS
   impl/scalar_quantizer/similarities.h
   impl/scalar_quantizer/sq-dispatch.h
   impl/scalar_quantizer/training.h
+  impl/scalar_quantizer/amx_bf16_ip.h
   impl/ThreadedIndex-inl.h
   impl/ThreadedIndex.h
   impl/index_read_utils.h
@@ -393,6 +395,20 @@ endif()
 target_sources(faiss_avx512_spr PRIVATE ${FAISS_SIMD_AVX2_SRC} ${FAISS_SIMD_AVX512_SRC})
 target_compile_definitions(faiss_avx512_spr PRIVATE COMPILE_SIMD_AVX2 COMPILE_SIMD_AVX512)
 
+
+add_library(faiss_amx ${FAISS_SRC})
+if(NOT FAISS_OPT_LEVEL STREQUAL "amx")
+  set_target_properties(faiss_amx PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+if(NOT WIN32)
+  # AMX build: Sapphire Rapids + AMX TILE + AMX BF16.
+  target_compile_options(faiss_amx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids -mamx-tile -mamx-bf16>)
+else()
+  target_compile_options(faiss_amx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
+  add_compile_options(/bigobj)
+endif()
+target_sources(faiss_amx PRIVATE ${FAISS_SIMD_AVX2_SRC} ${FAISS_SIMD_AVX512_SRC})
+target_compile_definitions(faiss_amx PRIVATE COMPILE_SIMD_AVX2 COMPILE_SIMD_AVX512 FAISS_OPT_AMX)
 add_library(faiss_sve ${FAISS_SRC})
 if(NOT FAISS_OPT_LEVEL STREQUAL "sve")
   set_target_properties(faiss_sve PROPERTIES EXCLUDE_FROM_ALL TRUE)
@@ -466,6 +482,7 @@ if(FAISS_ENABLE_SVS)
   target_link_libraries(faiss_avx2 PUBLIC svs::svs_runtime)
   target_link_libraries(faiss_avx512 PUBLIC svs::svs_runtime)
   target_link_libraries(faiss_avx512_spr PUBLIC svs::svs_runtime)
+target_link_libraries(faiss_amx PUBLIC svs::svs_runtime)
   target_link_libraries(faiss_sve PUBLIC svs::svs_runtime)
 
   install(DIRECTORY ${svs_SOURCE_DIR}/lib/ DESTINATION ${CMAKE_INSTALL_LIBDIR} FILES_MATCHING PATTERN "libsvs_runtime.so*")
@@ -483,11 +500,13 @@ target_include_directories(faiss_avx512 PUBLIC
 # Handle `#include <faiss/foo.h>`.
 target_include_directories(faiss_avx512_spr PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
+target_include_directories(faiss_amx PUBLIC
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
 # Handle `#include <faiss/foo.h>`.
 target_include_directories(faiss_sve PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
 
-set_target_properties(faiss faiss_avx2 faiss_avx512 faiss_avx512_spr faiss_sve PROPERTIES
+set_target_properties(faiss faiss_avx2 faiss_avx512 faiss_avx512_spr faiss_amx faiss_sve PROPERTIES
   POSITION_INDEPENDENT_CODE ON
   WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
@@ -498,6 +517,7 @@ if(WIN32)
   target_compile_definitions(faiss_avx512 PRIVATE FAISS_MAIN_LIB)
   target_compile_definitions(faiss_avx512_spr PRIVATE FAISS_MAIN_LIB)
   target_compile_definitions(faiss_sve PRIVATE FAISS_MAIN_LIB)
+target_compile_definitions(faiss_amx PRIVATE FAISS_MAIN_LIB)
 endif()
 
 if(FAISS_ENABLE_SVS)
@@ -505,6 +525,7 @@ if(FAISS_ENABLE_SVS)
   target_compile_definitions(faiss_avx2 PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
   target_compile_definitions(faiss_avx512 PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
   target_compile_definitions(faiss_avx512_spr PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
+  target_compile_definitions(faiss_amx PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
   target_compile_definitions(faiss_sve PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
 endif()
 
@@ -520,6 +541,7 @@ target_compile_definitions(faiss_avx2 PRIVATE FINTEGER=int)
 target_compile_definitions(faiss_avx512 PRIVATE FINTEGER=int)
 target_compile_definitions(faiss_avx512_spr PRIVATE FINTEGER=int)
 target_compile_definitions(faiss_sve PRIVATE FINTEGER=int)
+target_compile_definitions(faiss_amx PRIVATE FINTEGER=int)
 
 if(FAISS_USE_LTO)
   include(CheckIPOSupported)
@@ -541,6 +563,7 @@ target_link_libraries(faiss PRIVATE OpenMP::OpenMP_CXX)
 target_link_libraries(faiss_avx2 PRIVATE OpenMP::OpenMP_CXX)
 target_link_libraries(faiss_avx512 PRIVATE OpenMP::OpenMP_CXX)
 target_link_libraries(faiss_avx512_spr PRIVATE OpenMP::OpenMP_CXX)
+target_link_libraries(faiss_amx PRIVATE OpenMP::OpenMP_CXX)
 target_link_libraries(faiss_sve PRIVATE OpenMP::OpenMP_CXX)
 
 if(FAISS_ENABLE_MKL)
@@ -551,6 +574,7 @@ if(MKL_FOUND)
   target_link_libraries(faiss_avx2 PRIVATE ${MKL_LIBRARIES})
   target_link_libraries(faiss_avx512 PRIVATE ${MKL_LIBRARIES})
   target_link_libraries(faiss_avx512_spr PRIVATE ${MKL_LIBRARIES})
+  target_link_libraries(faiss_amx PRIVATE ${MKL_LIBRARIES})
   target_link_libraries(faiss_sve PRIVATE ${MKL_LIBRARIES})
 else()
   find_package(BLAS REQUIRED)
@@ -558,6 +582,7 @@ else()
   target_link_libraries(faiss_avx2 PRIVATE ${BLAS_LIBRARIES})
   target_link_libraries(faiss_avx512 PRIVATE ${BLAS_LIBRARIES})
   target_link_libraries(faiss_avx512_spr PRIVATE ${BLAS_LIBRARIES})
+  target_link_libraries(faiss_amx PRIVATE ${BLAS_LIBRARIES})
   target_link_libraries(faiss_sve PRIVATE ${BLAS_LIBRARIES})
 
   find_package(LAPACK REQUIRED)
@@ -565,6 +590,7 @@ else()
   target_link_libraries(faiss_avx2 PRIVATE ${LAPACK_LIBRARIES})
   target_link_libraries(faiss_avx512 PRIVATE ${LAPACK_LIBRARIES})
   target_link_libraries(faiss_avx512_spr PRIVATE ${LAPACK_LIBRARIES})
+  target_link_libraries(faiss_amx PRIVATE ${LAPACK_LIBRARIES})
   target_link_libraries(faiss_sve PRIVATE ${LAPACK_LIBRARIES})
 endif()
 
@@ -591,6 +617,13 @@ if(FAISS_OPT_LEVEL STREQUAL "avx512")
 endif()
 if(FAISS_OPT_LEVEL STREQUAL "avx512_spr")
   install(TARGETS faiss_avx2 faiss_avx512_spr
+    EXPORT faiss-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  )
+endif()
+if(FAISS_OPT_LEVEL STREQUAL "amx")
+  install(TARGETS faiss_avx2 faiss_amx
     EXPORT faiss-targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

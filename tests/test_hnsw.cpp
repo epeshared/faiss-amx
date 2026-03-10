@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <random>
@@ -661,3 +662,223 @@ TEST_F(HNSWTest, TEST_search_level_0) {
     EXPECT_GT(stats1.n1, stats2.n1);
     EXPECT_GT(stats1.n2, stats2.n2);
 }
+
+#if defined(FAISS_OPT_AMX)
+TEST(HNSW, Test_IndexHNSWSQ_BF16IP_AMXLevel0Lifecycle) {
+    omp_set_num_threads(1);
+
+    constexpr int d = 256;
+    constexpr int nb = 256;
+    constexpr int nq = 4;
+    constexpr int k = 8;
+    constexpr int M = 16;
+
+    std::vector<float> xb(d * nb);
+    std::vector<float> xq(d * nq);
+    faiss::float_rand(xb.data(), xb.size(), 1234);
+    std::copy(xb.begin(), xb.begin() + xq.size(), xq.begin());
+
+    faiss::IndexHNSWSQ index(
+            d,
+            faiss::ScalarQuantizer::QT_bf16,
+            M,
+            faiss::METRIC_INNER_PRODUCT);
+    index.hnsw.efConstruction = 80;
+    index.hnsw.efSearch = 64;
+
+    index.enable_amx_level0_optimization(32);
+    EXPECT_FALSE(index.using_amx_level0_optimization());
+
+    index.add(nb, xb.data());
+    EXPECT_FALSE(index.using_amx_level0_optimization());
+
+    index.finalize_amx_level0_optimization();
+    EXPECT_TRUE(index.using_amx_level0_optimization());
+
+    std::vector<float> distances(nq * k);
+    std::vector<faiss::idx_t> labels(nq * k, -1);
+
+    faiss::hnsw_stats.reset();
+    index.search(nq, xq.data(), k, distances.data(), labels.data());
+
+    EXPECT_GT(faiss::hnsw_stats.level0_batch_calls, 0);
+    EXPECT_GT(faiss::hnsw_stats.level0_batch_candidates, 0);
+    EXPECT_GE(
+            faiss::hnsw_stats.ndis,
+            faiss::hnsw_stats.level0_batch_candidates);
+    for (faiss::idx_t label : labels) {
+        EXPECT_GE(label, 0);
+    }
+
+    index.disable_amx_level0_optimization();
+    EXPECT_FALSE(index.using_amx_level0_optimization());
+
+    faiss::hnsw_stats.reset();
+    index.search(nq, xq.data(), k, distances.data(), labels.data());
+    EXPECT_EQ(faiss::hnsw_stats.level0_batch_calls, 0);
+    EXPECT_EQ(faiss::hnsw_stats.level0_batch_candidates, 0);
+}
+
+TEST(HNSW, Test_IndexHNSWSQ_BF16IP_AMXChunkPruning) {
+    omp_set_num_threads(1);
+
+    constexpr int d = 64;
+    constexpr int chunk_size = 16;
+    constexpr int n_chunks = 8;
+    constexpr int nb = chunk_size * n_chunks;
+    constexpr int k = 4;
+    constexpr int M = 16;
+
+    std::vector<float> xb(d * nb, 0.0f);
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int primary_dim = chunk % d;
+        const int secondary_dim = (primary_dim + 1) % d;
+        for (int i = 0; i < chunk_size; ++i) {
+            float* vec = xb.data() + (chunk * chunk_size + i) * d;
+            vec[primary_dim] = 1.0f;
+            vec[secondary_dim] = 0.01f * static_cast<float>(i + 1);
+        }
+    }
+
+    std::vector<float> xq(d, 0.0f);
+    xq[0] = 1.0f;
+
+    faiss::IndexHNSWSQ index(
+            d,
+            faiss::ScalarQuantizer::QT_bf16,
+            M,
+            faiss::METRIC_INNER_PRODUCT);
+    index.hnsw.efConstruction = 80;
+    index.hnsw.efSearch = 64;
+
+    index.enable_amx_level0_optimization(chunk_size);
+    index.add(nb, xb.data());
+
+    index.hnsw.entry_point = 0;
+    for (faiss::idx_t i = 0; i < nb; ++i) {
+        size_t begin, end;
+        index.hnsw.neighbor_range(i, 0, &begin, &end);
+        size_t cursor = begin;
+        const faiss::idx_t chunk_begin = (i / chunk_size) * chunk_size;
+        const faiss::idx_t chunk_end = chunk_begin + chunk_size;
+
+        if (i + 1 < chunk_end && cursor < end) {
+            index.hnsw.neighbors[cursor++] = i + 1;
+        }
+        if (i > chunk_begin && cursor < end) {
+            index.hnsw.neighbors[cursor++] = i - 1;
+        }
+        if (i == chunk_begin && chunk_end < nb && cursor < end) {
+            index.hnsw.neighbors[cursor++] = chunk_end;
+        }
+        while (cursor < end) {
+            index.hnsw.neighbors[cursor++] = -1;
+        }
+    }
+
+    index.finalize_amx_level0_optimization();
+
+    std::unique_ptr<faiss::DistanceComputer> scoring_qdis(
+            new faiss::NegativeDistanceComputer(
+                    index.storage->get_distance_computer()));
+    scoring_qdis->set_query(xq.data());
+
+    std::vector<std::pair<float, faiss::idx_t>> scored;
+    scored.reserve(nb);
+    for (faiss::idx_t i = 0; i < nb; ++i) {
+        scored.emplace_back((*scoring_qdis)(i), i);
+    }
+    std::sort(scored.begin(), scored.end());
+
+    const faiss::idx_t good_chunk = scored.front().second / chunk_size;
+
+    auto* sq_storage = dynamic_cast<faiss::IndexScalarQuantizer*>(index.storage);
+    ASSERT_NE(sq_storage, nullptr);
+    sq_storage->sq.amx_hnsw_chunk_centroids.assign(n_chunks * d, 0.0f);
+    sq_storage->sq.amx_hnsw_chunk_radii.assign(n_chunks, 0.05f);
+    for (faiss::idx_t chunk = 0; chunk < n_chunks; ++chunk) {
+        float* centroid =
+                sq_storage->sq.amx_hnsw_chunk_centroids.data() + chunk * d;
+        centroid[chunk == good_chunk ? 0 : ((chunk + 1) % d)] = 1.0f;
+    }
+
+    std::unique_ptr<faiss::DistanceComputer> qdis(
+            new faiss::NegativeDistanceComputer(
+                    index.storage->get_distance_computer()));
+    qdis->set_query(xq.data());
+    EXPECT_TRUE(qdis->supports_level0_batch_chunk());
+    EXPECT_TRUE(qdis->supports_level0_chunk_pruning());
+
+    const faiss::idx_t anchor = scored.front().second;
+    const float threshold = scored[k - 1].first;
+
+    std::vector<faiss::idx_t> prunable_chunks;
+    for (faiss::idx_t chunk = 0; chunk < n_chunks; ++chunk) {
+        const float lower_bound = qdis->level0_chunk_distance_lower_bound(chunk);
+        if (chunk == good_chunk) {
+            continue;
+        }
+        if (lower_bound > threshold) {
+            prunable_chunks.push_back(chunk);
+        }
+    }
+    ASSERT_FALSE(prunable_chunks.empty());
+
+    size_t begin, end;
+    index.hnsw.neighbor_range(anchor, 0, &begin, &end);
+    size_t cursor = begin;
+
+    for (const auto& [distance, id] : scored) {
+        (void)distance;
+        if (id / chunk_size == good_chunk && cursor < end) {
+            index.hnsw.neighbors[cursor++] = id;
+            if (cursor - begin == static_cast<size_t>(k)) {
+                break;
+            }
+        }
+    }
+    for (faiss::idx_t chunk : prunable_chunks) {
+        if (cursor >= end) {
+            break;
+        }
+        index.hnsw.neighbors[cursor++] = chunk * chunk_size;
+    }
+    while (cursor < end) {
+        index.hnsw.neighbors[cursor++] = -1;
+    }
+
+    faiss::HNSW::MinimaxHeap candidates(32);
+    for (int i = 0; i < k; ++i) {
+        candidates.push(scored[i].second, scored[i].first);
+    }
+
+    std::vector<float> distances(k, std::numeric_limits<float>::infinity());
+    std::vector<faiss::idx_t> labels(k, -1);
+    using RH = faiss::HeapBlockResultHandler<faiss::HNSW::C>;
+    RH block_result_handler(1, distances.data(), labels.data(), k);
+    RH::SingleResultHandler result_handler(block_result_handler);
+    faiss::VisitedTable visited(index.ntotal, index.hnsw.use_visited_hashset);
+    faiss::HNSWStats stats;
+
+    result_handler.begin(0);
+    faiss::search_from_candidates(
+            index.hnsw,
+            *qdis,
+            result_handler,
+            candidates,
+            visited,
+            stats,
+            0,
+            0,
+            nullptr);
+    result_handler.end();
+
+    EXPECT_GT(stats.level0_batch_calls, 0);
+    EXPECT_GT(stats.level0_batch_candidates, 0);
+    EXPECT_GT(stats.level0_pruned_chunks, 0);
+    EXPECT_GT(stats.level0_pruned_candidates, 0);
+    for (faiss::idx_t label : labels) {
+        EXPECT_GE(label, 0);
+    }
+}
+#endif
